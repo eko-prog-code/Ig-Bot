@@ -1,6 +1,6 @@
 import express from 'express';
 import cors from 'cors';
-import { IgApiClient } from 'instagram-private-api';
+import { IgApiClient, IgCheckpointError } from 'instagram-private-api';
 import axios from 'axios';
 import dotenv from 'dotenv';
 
@@ -14,19 +14,23 @@ async function login() {
         await ig.account.login(process.env.INSTAGRAM_USERNAME, process.env.INSTAGRAM_PASSWORD);
         console.log('Login successful');
     } catch (error) {
-        console.error('Error during login:', error.message);
-        throw error;
+        if (error instanceof IgCheckpointError) {
+            console.error('Checkpoint required. Please resolve the challenge manually.');
+            throw error; // Handle checkpoint resolution manually
+        } else {
+            console.error('Error during login:', error);
+            throw error;
+        }
     }
 }
 
 async function getMediaIdFromUrl(url) {
-    const regex = /\/p\/([^/]+)\//;
+    const regex = /\/p\/([^/?]+)/;
     const match = url.match(regex);
     if (match) {
         const shortcode = match[1];
         try {
             const { data } = await axios.get(`https://www.instagram.com/p/${shortcode}/?__a=1&__d=dis`);
-            console.log("Full response data:", data);
             if (data && data.graphql && data.graphql.shortcode_media) {
                 return data.graphql.shortcode_media.id;
             } else {
@@ -34,78 +38,110 @@ async function getMediaIdFromUrl(url) {
                 throw new Error('Invalid response structure');
             }
         } catch (error) {
-            console.error('Error fetching media ID:', error.message);
+            console.error('Error fetching media ID:', error);
             throw error;
         }
     } else {
+        console.error('Invalid URL format:', url);
         throw new Error('Invalid URL');
     }
 }
 
 async function getComments(mediaId) {
-    const comments = [];
     try {
         const commentsFeed = ig.feed.mediaComments(mediaId);
-        do {
-            const items = await commentsFeed.items();
-            comments.push(...items);
-        } while (commentsFeed.isMoreAvailable());
+        const comments = await commentsFeed.items();
+        return comments;
     } catch (error) {
-        console.error('Error fetching comments:', error.message);
+        if (error instanceof IgCheckpointError) {
+            console.error('Checkpoint required while fetching comments. Please resolve the challenge manually.');
+            throw error; // Handle checkpoint resolution manually
+        } else {
+            console.error('Error fetching comments:', error);
+            return [];
+        }
     }
-    return comments;
 }
 
 async function sendDirectMessage(userId, message) {
     try {
         const thread = ig.entity.directThread([userId.toString()]);
         await thread.broadcastText(message);
+        console.log(`Message sent to user ID: ${userId}`);
     } catch (error) {
-        console.error('Error sending direct message:', error.message);
+        if (error instanceof IgCheckpointError) {
+            console.error('Checkpoint required while sending messages. Please resolve the challenge manually.');
+            throw error; // Handle checkpoint resolution manually
+        } else {
+            console.error(`Error sending message to user ID ${userId}:`, error);
+        }
     }
 }
 
 async function fetchMessageFromFirebase() {
     try {
         const { data } = await axios.get('https://chatbot-e4c87-default-rtdb.firebaseio.com/PesanInstagramBot.json');
-        return data.message; // Sesuaikan dengan struktur data yang ada di Firebase
+        return data;
     } catch (error) {
-        console.error('Error fetching message from Firebase:', error.message);
+        console.error('Error fetching message from Firebase:', error);
         throw error;
     }
 }
 
-async function fetchTargetPostUrlFromFirebase() {
+async function fetchTargetPostUrlsFromFirebase() {
     try {
-        const { data } = await axios.get('https://chatbot-e4c87-default-rtdb.firebaseio.com/targetUrlInstagram.json');
-        console.log('Fetched target post URL:', data);
-        return data.url; // Sesuaikan dengan struktur data yang ada di Firebase
+        const { data } = await axios.get('https://chatbot-e4c87-default-rtdb.firebaseio.com/targetUrlsInstagram.json');
+        console.log('Fetched target post URLs:', data);
+        return data;
     } catch (error) {
-        console.error('Error fetching target post URL from Firebase:', error.message);
+        console.error('Error fetching target post URLs from Firebase:', error);
         throw error;
     }
+}
+
+function delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 async function checkComments() {
-    await login();
-
     try {
-        const targetPostUrl = await fetchTargetPostUrlFromFirebase(); // Fetch target URL from Firebase
-        if (!targetPostUrl) {
-            throw new Error('targetPostUrl is undefined or empty');
-        }
-        console.log('Using target post URL:', targetPostUrl);
-        const mediaId = await getMediaIdFromUrl(targetPostUrl);
-        const comments = await getComments(mediaId);
-        const message = await fetchMessageFromFirebase(); // Ambil pesan dari Firebase
-        for (const comment of comments) {
-            if (comment.text.toLowerCase().includes('mau')) {
-                await sendDirectMessage(comment.user_id, message); // Gunakan pesan dari Firebase
-                console.log(`Pesan terkirim ke: ${comment.user.username}`);
+        await login();
+
+        const targetPostUrls = await fetchTargetPostUrlsFromFirebase();
+        const messages = await fetchMessageFromFirebase();
+
+        console.log('Target Post URLs:', targetPostUrls);
+        console.log('Messages:', messages);
+
+        for (let i = 1; i <= 10; i++) {
+            const targetPostUrl = targetPostUrls[`url${i}`];
+            const message = messages[`message${i}`];
+
+            if (!targetPostUrl || !message) {
+                console.warn(`No URL or message found for url${i} or message${i}`);
+                continue;
             }
+
+            console.log(`Using target URL: ${targetPostUrl}`);
+
+            try {
+                const mediaId = await getMediaIdFromUrl(targetPostUrl);
+                const comments = await getComments(mediaId);
+
+                for (const comment of comments) {
+                    if (comment.text.toLowerCase().includes('mau')) {
+                        await sendDirectMessage(comment.user.pk, message);
+                        await delay(1000); // 1 second delay between messages
+                    }
+                }
+            } catch (error) {
+                console.error(`Error processing url${i}:`, error);
+            }
+
+            await delay(5000); // 5 seconds delay between posts
         }
     } catch (error) {
-        console.error('Error in checkComments:', error.message);
+        console.error('Error in checkComments:', error);
     }
 }
 
@@ -113,7 +149,7 @@ const app = express();
 app.use(cors());
 
 app.get("/", (req, res) => {
-    res.send("Hello World");
+    res.send("Instagram Bot Server Running");
 });
 
 app.listen(6000, () => {
