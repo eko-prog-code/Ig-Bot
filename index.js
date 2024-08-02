@@ -152,7 +152,8 @@ app.get("/", (req, res) => {
     res.send("Instagram Bot Server Running");
 });
 
-app.listen(6000, () => {
-    console.log("Server is running on port 6000");
+const PORT = process.env.PORT || 6000;
+app.listen(PORT, () => {
+    console.log(`Server is running on port ${PORT}`);
     checkComments();
 });
